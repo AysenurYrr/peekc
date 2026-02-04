@@ -3,35 +3,35 @@
 #include <stdlib.h>
 
 #include "lexer.h"
+#include "buffer_helper.h"
 
-// Minimal buffer helpers to append cleaned text into buffer->data
-// Assumes Buffer has fields: char *data; size_t len;
-static void buffer_init(struct Buffer *b) {
-    if (!b->data) {
-        b->len = 0;
-        b->data = (char*)malloc(1);
-        if (b->data) b->data[0] = '\0';
-    }
-}
-static void buffer_grow(struct Buffer *b, size_t need) {
-    size_t new_size = b->len + need + 1; // +1 for null terminator
-    char *nd = (char*)realloc(b->data, new_size);
-    if (nd) {
-        b->data = nd;
-    }
-}
-static void buffer_append_char(struct Buffer *b, char ch) {
-    buffer_grow(b, 1);
-    if (!b->data) return;
-    b->data[b->len++] = ch;
-    b->data[b->len] = '\0';
-}
 
+static int is_space_c(int c){ return c==' '||c=='\n'||c=='\t'||c=='\r'||c=='\f'||c=='\v'; }
+static int is_ident_start_c(int c){ return c=='_'||(c>='a'&&c<='z')||(c>='A'&&c<='Z'); }
+static int is_ident_char_c(int c){ return is_ident_start_c(c)||(c>='0'&&c<='9'); }
+static int is_digit_c(int c){ return c>='0'&&c<='9'; }
+
+static TokenKind kw_kind(const char *s, size_t n) {
+    // compare with fixed keywords
+    #define KW(x, k) if (n==sizeof(x)-1 && memcmp(s, x, sizeof(x)-1)==0) return k
+    KW("struct",   TK_KW_STRUCT);
+    KW("union",    TK_KW_UNION);
+    KW("enum",     TK_KW_ENUM);
+    KW("typedef",  TK_KW_TYPEDEF);
+    KW("const",    TK_KW_CONST);
+    KW("volatile", TK_KW_VOLATILE);
+    KW("unsigned", TK_KW_UNSIGNED);
+    KW("signed",   TK_KW_SIGNED);
+    KW("long",     TK_KW_LONG);
+    KW("short",    TK_KW_SHORT);
+    #undef KW
+    return TK_IDENT;
+}
 
 /*
 for minimum viable product i just write it to a buffer but later 
 i can implement more sophisticated handling 
-todo: parse it when reading that way we can emit the buffer contents more easily
+TODO: parse it when reading that way we can emit the buffer contents more easily
 */ 
 int clean_file_to_buffer(FILE *file, struct Buffer *buffer)
 {
@@ -140,92 +140,59 @@ int clean_file_to_buffer(FILE *file, struct Buffer *buffer)
     return 0;
 }
 
-static int is_ident_char(int ch) {
-    return (ch == '_' || (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z'));
+
+static void lex_init(Lexer *lx, const char *src, size_t len) {
+    lx->src = src; lx->len = len; lx->pos = 0;
 }
 
-int find_struct_block(const char *src, size_t len,
-                      const char *target_name,
-                      struct StructBlock *out)
-{
-    if (!src || !target_name || !out) return -1;
-    const char *name = target_name;
+static Token lex_next(Lexer *lx) {
+    const char *s = lx->src;
+    size_t n = lx->len;
+    size_t p = lx->pos;
 
-    // scan for either "struct" or "typedef struct"
-    for (size_t i = 0; i + 6 < len; ++i) {
-        // skip whitespace
-        if (src[i] == ' ' || src[i] == '\n' || src[i] == '\t' || src[i] == '\r') continue;
+    while (p < n && is_space_c((unsigned char)s[p])) p++;
+    if (p >= n) { lx->pos = p; return (Token){TK_EOF, p, p}; }
 
-        int is_typedef = 0;
-        size_t pos = i;
-        // try match "typedef struct"
-        if (pos + 7 < len && strncmp(src + pos, "typedef", 7) == 0) {
-            pos += 7;
-            while (pos < len && (src[pos] == ' ' || src[pos] == '\n' || src[pos] == '\t')) pos++;
-            if (pos + 6 < len && strncmp(src + pos, "struct", 6) == 0) {
-                is_typedef = 1;
-            } else {
-                continue;
-            }
-        }
-        // try match "struct"
-        if (pos + 6 < len && strncmp(src + pos, "struct", 6) == 0) {
-            size_t start = pos;
-            pos += 6;
-            // skip whitespace
-            while (pos < len && (src[pos] == ' ' || src[pos] == '\n' || src[pos] == '\t')) pos++;
-            // optional tag name must match target_name
-            size_t tag_begin = pos;
-            while (pos < len && is_ident_char((unsigned char)src[pos])) pos++;
-            size_t tag_end = pos;
-            if (tag_end > tag_begin) {
-                size_t tag_len = tag_end - tag_begin;
-                if (strlen(name) == tag_len && strncmp(src + tag_begin, name, tag_len) == 0) {
-                    // ok
-                } else {
-                    // not our target
-                    continue;
-                }
-            } else {
-                // anonymous struct; skip
-                continue;
-            }
-            // skip whitespace to '{'
-            while (pos < len && (src[pos] == ' ' || src[pos] == '\n' || src[pos] == '\t')) pos++;
-            if (pos >= len || src[pos] != '{') {
-                continue;
-            }
-            size_t lbrace = pos;
+    char c = s[p];
 
-            // find matching '}' with simple brace counter
-            size_t rbrace = lbrace;
-            int depth = 0;
-            for (; rbrace < len; ++rbrace) {
-                if (src[rbrace] == '{') depth++;
-                else if (src[rbrace] == '}') {
-                    depth--;
-                    if (depth == 0) break;
-                }
-            }
-            if (rbrace >= len || depth != 0) {
-                continue; // unmatched
-            }
-
-            // find the ending ';' after rbrace (typdef may have alias)
-            size_t end = rbrace + 1;
-            while (end < len && (src[end] == ' ' || src[end] == '\n' || src[end] == '\t')) end++;
-            if (is_typedef) {
-                while (end < len && src[end] != ';') end++;
-                if (end < len) end++; // include ';'
-            }
-
-            out->start = start;
-            out->lbrace = lbrace;
-            out->rbrace = rbrace;
-            out->end = end;
-            out->is_typedef = is_typedef;
-            return 0;
-        }
+    // punctuation
+    switch (c) {
+        case '{': lx->pos=p+1; return (Token){TK_LBRACE,p,p+1};
+        case '}': lx->pos=p+1; return (Token){TK_RBRACE,p,p+1};
+        case '[': lx->pos=p+1; return (Token){TK_LBRACK,p,p+1};
+        case ']': lx->pos=p+1; return (Token){TK_RBRACK,p,p+1};
+        case '(': lx->pos=p+1; return (Token){TK_LPAREN,p,p+1};
+        case ')': lx->pos=p+1; return (Token){TK_RPAREN,p,p+1};
+        case ';': lx->pos=p+1; return (Token){TK_SEMI,p,p+1};
+        case '*': lx->pos=p+1; return (Token){TK_STAR,p,p+1};
+        case ',': lx->pos=p+1; return (Token){TK_COMMA,p,p+1};
+        case ':': lx->pos=p+1; return (Token){TK_COLON,p,p+1};
+        default: break;
     }
-    return -1; // not found
+
+    // number
+    if (is_digit_c((unsigned char)c)) {
+        size_t a=p;
+        while (p<n && is_digit_c((unsigned char)s[p])) p++;
+        lx->pos=p;
+        return (Token){TK_NUMBER,a,p};
+    }
+
+    // identifier / keyword
+    if (is_ident_start_c((unsigned char)c)) {
+        size_t a=p;
+        while (p<n && is_ident_char_c((unsigned char)s[p])) p++;
+        lx->pos=p;
+        TokenKind k = kw_kind(s+a, p-a);
+        return (Token){k,a,p};
+    }
+
+    // unknown char: skip it (MVP)
+    lx->pos = p+1;
+    return lex_next(lx);
+}
+
+static const char* tok_text(const Lexer *lx, Token t, size_t *out_len) {
+    if (out_len) *out_len = t.b - t.a;
+    return lx->src + t.a;
 }
